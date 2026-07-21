@@ -5,15 +5,30 @@ from torch.optim.optimizer import Optimizer
 
 
 def build_optimizer(cfg_optimizer, model):
-    weights, biases = [], []
-    for name, param in model.named_parameters():
-        if 'bias' in name:
-            biases += [param]
-        else:
-            weights += [param]
+    cop_cfg = cfg_optimizer.get('cop', {})
+    cop_enabled = bool(cop_cfg.get('enabled', False))
+    joint_lr_scale = float(cop_cfg.get('joint_lr_scale', 0.1))
+    if joint_lr_scale <= 0.0:
+        raise ValueError('cop.joint_lr_scale must be positive')
 
-    parameters = [{'params': biases, 'weight_decay': 0},
-                  {'params': weights, 'weight_decay': cfg_optimizer['weight_decay']}]
+    grouped = {}
+    cop_names = (
+        'size_attr_net', 'angle_attr_net', 'depth_attr_net',
+        'size_residual_embed', 'chain_depth_embed')
+    for name, param in model.named_parameters():
+        is_cop = cop_enabled and any(token in name for token in cop_names)
+        is_bias = name.endswith('bias')
+        key = (is_cop, is_bias)
+        grouped.setdefault(key, []).append(param)
+
+    parameters = []
+    for (is_cop, is_bias), params in grouped.items():
+        lr_scale = 1.0 if is_cop else (joint_lr_scale if cop_enabled else 1.0)
+        parameters.append({
+            'params': params,
+            'lr': cfg_optimizer['lr'] * lr_scale,
+            'weight_decay': 0 if is_bias else cfg_optimizer['weight_decay'],
+        })
 
     if cfg_optimizer['type'] == 'sgd':
         optimizer = optim.SGD(parameters, lr=cfg_optimizer['lr'], momentum=0.9)

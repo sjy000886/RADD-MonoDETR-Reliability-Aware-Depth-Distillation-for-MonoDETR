@@ -17,6 +17,7 @@ from .matcher import build_matcher
 from .depthaware_transformer import build_depthaware_transformer
 from .depth_predictor import DepthPredictor
 from .depth_predictor.ddn_loss import DDNLoss
+from .attribute_net import AttributeNet, groupwise_random_route
 from lib.losses.focal_loss import sigmoid_focal_loss
 from lib.losses.teacher_depth_loss import TeacherDepthFeatureLoss
 from .dn_components import prepare_for_dn, dn_post_process, compute_dn_loss
@@ -29,7 +30,8 @@ def _get_clones(module, N):
 class MonoDETR(nn.Module):
     """ This is the MonoDETR module that performs monocualr 3D object detection """
     def __init__(self, backbone, depthaware_transformer, depth_predictor, num_classes, num_queries, num_feature_levels,
-                 aux_loss=True, with_box_refine=False, two_stage=False, init_box=False, use_dab=False, group_num=11, two_stage_dino=False):
+                 aux_loss=True, with_box_refine=False, two_stage=False, init_box=False, use_dab=False, group_num=11,
+                 two_stage_dino=False, cop_cfg=None):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -50,6 +52,17 @@ class MonoDETR(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_feature_levels = num_feature_levels
         self.two_stage_dino = two_stage_dino
+        self.group_num = group_num
+        cop_cfg = cop_cfg or {}
+        self.cop_enabled = bool(cop_cfg.get('enabled', False))
+        self.train_chain_prob = float(cop_cfg.get('train_chain_prob', 0.5))
+        self.uncertainty_tau = float(cop_cfg.get('uncertainty_tau', 0.0))
+        self.size_residual_scale = float(cop_cfg.get('size_residual_scale', 0.1))
+        self.selector_enabled = bool(cop_cfg.get('selector_enabled', True))
+        if not 0.0 <= self.train_chain_prob <= 1.0:
+            raise ValueError("cop.train_chain_prob must be in [0, 1]")
+        if self.size_residual_scale < 0.0:
+            raise ValueError("cop.size_residual_scale must be non-negative")
         self.label_enc = nn.Embedding(num_classes + 1, hidden_dim - 1)  # # for indicator
         # prediction heads
         self.class_embed = nn.Linear(hidden_dim, num_classes)
@@ -61,6 +74,15 @@ class MonoDETR(nn.Module):
         self.dim_embed_3d = MLP(hidden_dim, hidden_dim, 3, 2)
         self.angle_embed = MLP(hidden_dim, hidden_dim, 24, 2)
         self.depth_embed = MLP(hidden_dim, hidden_dim, 2, 2)  # depth and deviation
+        if self.cop_enabled:
+            self.size_attr_net = AttributeNet(hidden_dim, hidden_dim, hidden_dim)
+            self.angle_attr_net = AttributeNet(hidden_dim, hidden_dim, hidden_dim)
+            self.depth_attr_net = AttributeNet(hidden_dim, hidden_dim, hidden_dim)
+            self.size_residual_embed = nn.Linear(hidden_dim, 3)
+            self.chain_depth_embed = MLP(hidden_dim, hidden_dim, 2, 2)
+            # Start from the RADD size estimate and let CoP learn a correction.
+            nn.init.constant_(self.size_residual_embed.weight, 0)
+            nn.init.constant_(self.size_residual_embed.bias, 0)
         self.use_dab = use_dab
 
         if init_box == True:
@@ -132,6 +154,12 @@ class MonoDETR(nn.Module):
             self.depthaware_transformer.decoder.dim_embed = self.dim_embed_3d  
             self.angle_embed = _get_clones(self.angle_embed, num_pred)
             self.depth_embed = _get_clones(self.depth_embed, num_pred)
+            if self.cop_enabled:
+                self.size_attr_net = _get_clones(self.size_attr_net, num_pred)
+                self.angle_attr_net = _get_clones(self.angle_attr_net, num_pred)
+                self.depth_attr_net = _get_clones(self.depth_attr_net, num_pred)
+                self.size_residual_embed = _get_clones(self.size_residual_embed, num_pred)
+                self.chain_depth_embed = _get_clones(self.chain_depth_embed, num_pred)
         else:
             nn.init.constant_(self.bbox_embed.layers[-1].bias.data[2:], -2.0)
             self.class_embed = nn.ModuleList([self.class_embed for _ in range(num_pred)])
@@ -139,6 +167,12 @@ class MonoDETR(nn.Module):
             self.dim_embed_3d = nn.ModuleList([self.dim_embed_3d for _ in range(num_pred)])
             self.angle_embed = nn.ModuleList([self.angle_embed for _ in range(num_pred)])
             self.depth_embed = nn.ModuleList([self.depth_embed for _ in range(num_pred)])
+            if self.cop_enabled:
+                self.size_attr_net = nn.ModuleList([self.size_attr_net for _ in range(num_pred)])
+                self.angle_attr_net = nn.ModuleList([self.angle_attr_net for _ in range(num_pred)])
+                self.depth_attr_net = nn.ModuleList([self.depth_attr_net for _ in range(num_pred)])
+                self.size_residual_embed = nn.ModuleList([self.size_residual_embed for _ in range(num_pred)])
+                self.chain_depth_embed = nn.ModuleList([self.chain_depth_embed for _ in range(num_pred)])
             self.depthaware_transformer.decoder.bbox_embed = None
 
         if two_stage:
@@ -146,6 +180,55 @@ class MonoDETR(nn.Module):
             self.depthaware_transformer.decoder.class_embed = self.class_embed
             for box_embed in self.bbox_embed:
                 nn.init.constant_(box_embed.layers[-1].bias.data[2:], 0.0)
+
+    def set_cop_train_stage(self, stage):
+        """Apply the two-stage CoP fine-tuning policy.
+
+        ``cop_only`` freezes the complete pre-trained RADD model. ``joint``
+        additionally unfreezes the decoder and the existing 3D heads at their
+        optimizer-configured lower learning rate. The backbone and depth
+        predictor remain frozen in both stages.
+        """
+        if not self.cop_enabled:
+            return
+        if stage not in ('cop_only', 'joint', 'all'):
+            raise ValueError(f"unknown CoP training stage: {stage}")
+
+        if stage == 'all':
+            for parameter in self.parameters():
+                parameter.requires_grad_(True)
+            return
+
+        for parameter in self.parameters():
+            parameter.requires_grad_(False)
+
+        cop_modules = (
+            self.size_attr_net,
+            self.angle_attr_net,
+            self.depth_attr_net,
+            self.size_residual_embed,
+            self.chain_depth_embed,
+        )
+        for module in cop_modules:
+            for parameter in module.parameters():
+                parameter.requires_grad_(True)
+
+        if stage == 'joint':
+            joint_modules = (
+                self.depthaware_transformer.decoder,
+                self.dim_embed_3d,
+                self.angle_embed,
+                self.depth_embed,
+            )
+            for module in joint_modules:
+                for parameter in module.parameters():
+                    parameter.requires_grad_(True)
+
+    @staticmethod
+    def _fuse_depth(depth_reg, depth_geo, depth_map):
+        regressed_depth = 1.0 / (depth_reg[..., 0:1].sigmoid() + 1e-6) - 1.0
+        mean_depth = (regressed_depth + depth_geo.unsqueeze(-1) + depth_map) / 3.0
+        return torch.cat((mean_depth, depth_reg[..., 1:2]), dim=-1)
 
 
     def forward(self, images, calibs, targets, img_sizes, dn_args=None):
@@ -211,6 +294,7 @@ class MonoDETR(nn.Module):
         outputs_3d_dims = []
         outputs_depths = []
         outputs_angles = []
+        route_mask = None
 
         for lvl in range(hs.shape[0]):
             if lvl == 0:
@@ -235,17 +319,32 @@ class MonoDETR(nn.Module):
             outputs_class = self.class_embed[lvl](hs[lvl])
             outputs_classes.append(outputs_class)
 
-            # 3D sizes
-            size3d = inter_references_dim[lvl]
+            # 3D attributes. CoP refines the existing RADD size and propagates
+            # attribute features in the order size -> angle -> depth.
+            base_size3d = inter_references_dim[lvl]
+            if self.cop_enabled:
+                size_feat = hs[lvl] + self.size_attr_net[lvl](hs[lvl])
+                size_residual = self.size_residual_embed[lvl](size_feat)
+                size3d = base_size3d + self.size_residual_scale * size_residual
+
+                angle_feat = size_feat + self.angle_attr_net[lvl](size_feat)
+                outputs_angle = self.angle_embed[lvl](angle_feat)
+
+                depth_feat = angle_feat + self.depth_attr_net[lvl](angle_feat)
+                chain_depth_reg = self.chain_depth_embed[lvl](depth_feat)
+            else:
+                size3d = base_size3d
+                outputs_angle = self.angle_embed[lvl](hs[lvl])
             outputs_3d_dims.append(size3d)
 
             # depth_geo
             box2d_height_norm = outputs_coord[:, :, 4] + outputs_coord[:, :, 5]
             box2d_height = torch.clamp(box2d_height_norm * img_sizes[:, 1: 2], min=1.0)
-            depth_geo = size3d[:, :, 0] / box2d_height * calibs[:, 0, 0].unsqueeze(1)
+            focal_length = calibs[:, 0, 0].unsqueeze(1)
+            depth_geo = size3d[:, :, 0] / box2d_height * focal_length
 
             # depth_reg
-            depth_reg = self.depth_embed[lvl](hs[lvl])
+            parallel_depth_reg = self.depth_embed[lvl](hs[lvl])
 
             # depth_map
             outputs_center3d = ((outputs_coord[..., :2] - 0.5) * 2).unsqueeze(2).detach()
@@ -255,13 +354,32 @@ class MonoDETR(nn.Module):
                 mode='bilinear',
                 align_corners=True).squeeze(1)
 
-            # depth average + sigma
-            depth_ave = torch.cat([((1. / (depth_reg[:, :, 0: 1].sigmoid() + 1e-6) - 1.) + depth_geo.unsqueeze(-1) + depth_map) / 3,
-                                    depth_reg[:, :, 1: 2]], -1)
+            # Both CoP and the original parallel branch retain RADD's average
+            # of regressed depth, geometric depth and sampled DDN depth.
+            parallel_depth_geo = (
+                base_size3d[:, :, 0] / box2d_height * focal_length)
+            parallel_depth = self._fuse_depth(
+                parallel_depth_reg, parallel_depth_geo, depth_map)
+            if self.cop_enabled:
+                chain_depth = self._fuse_depth(
+                    chain_depth_reg, depth_geo, depth_map)
+                if self.training:
+                    depth_ave, route_mask = groupwise_random_route(
+                        chain_depth,
+                        parallel_depth,
+                        self.group_num,
+                        chain_prob=self.train_chain_prob,
+                        mask=route_mask)
+                elif self.selector_enabled:
+                    use_chain = chain_depth[..., 1:2] < self.uncertainty_tau
+                    depth_ave = torch.where(use_chain, chain_depth, parallel_depth)
+                else:
+                    depth_ave = chain_depth
+            else:
+                depth_ave = parallel_depth
             outputs_depths.append(depth_ave)
 
             # angles
-            outputs_angle = self.angle_embed[lvl](hs[lvl])
             outputs_angles.append(outputs_angle)
 
         outputs_coord = torch.stack(outputs_coords)
@@ -606,7 +724,9 @@ def build(cfg):
         two_stage=cfg['two_stage'],
         init_box=cfg['init_box'],
         use_dab = cfg['use_dab'],
-        two_stage_dino=cfg['two_stage_dino'])
+        group_num=cfg.get('group_num', 11),
+        two_stage_dino=cfg['two_stage_dino'],
+        cop_cfg=cfg.get('cop', {}))
 
     # matcher
     matcher = build_matcher(cfg)
@@ -657,6 +777,7 @@ def build(cfg):
         weight_dict=weight_dict,
         focal_alpha=cfg['focal_alpha'],
         losses=losses,
+        group_num=cfg.get('group_num', 11),
         teacher_depth_cfg=teacher_depth_cfg)
 
     device = torch.device(cfg['device'])

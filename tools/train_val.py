@@ -42,6 +42,12 @@ def main():
     cfg['dataset']['teacher_depth'] = copy.deepcopy(teacher_depth_cfg)
     cfg['model']['teacher_depth'] = copy.deepcopy(teacher_depth_cfg)
 
+    # Keep one CoP block authoritative for model routing and staged fine-tuning.
+    cop_cfg = copy.deepcopy(cfg.get('cop', {}))
+    cfg['model']['cop'] = copy.deepcopy(cop_cfg)
+    cfg['trainer']['cop'] = copy.deepcopy(cop_cfg)
+    cfg['optimizer']['cop'] = copy.deepcopy(cop_cfg)
+
     model_name = cfg['model_name']
     output_path = os.path.join('./' + cfg["trainer"]['save_path'], model_name)
     os.makedirs(output_path, exist_ok=True)

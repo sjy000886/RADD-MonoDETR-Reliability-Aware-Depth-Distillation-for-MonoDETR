@@ -40,6 +40,15 @@ class Trainer(object):
         self.model_name = model_name
         self.output_dir = os.path.join('./' + cfg['save_path'], model_name)
         self.tester = None
+        self.cop_cfg = cfg.get('cop', {})
+        self.cop_enabled = bool(self.cop_cfg.get('enabled', False))
+        self.cop_freeze_base_epochs = int(
+            self.cop_cfg.get('freeze_base_epochs', 0))
+        self._cop_stage = None
+        self._cop_staged_training = (
+            self.cop_enabled
+            and self.cop_freeze_base_epochs > 0
+            and bool(cfg.get('pretrain_model') or cfg.get('resume_model')))
 
         # loading pretrain/resume model
         if cfg.get('pretrain_model'):
@@ -48,7 +57,8 @@ class Trainer(object):
                             optimizer=None,
                             filename=cfg['pretrain_model'],
                             map_location=self.device,
-                            logger=self.logger)
+                            logger=self.logger,
+                            strict=not self.cop_enabled)
 
         if cfg.get('resume_model', None):
             resume_model_path = os.path.join(self.output_dir, "checkpoint.pth")
@@ -61,6 +71,29 @@ class Trainer(object):
                 logger=self.logger)
             self.lr_scheduler.last_epoch = self.epoch - 1
             self.logger.info("Loading Checkpoint... Best Result:{}, Best Epoch:{}".format(self.best_result, self.best_epoch))
+
+        if (self.cop_enabled and self.cop_freeze_base_epochs > 0
+                and not self._cop_staged_training):
+            self.logger.warning(
+                'CoP staged fine-tuning was requested without pretrain_model '
+                'or resume_model; leaving the full model trainable.')
+        self._set_cop_train_stage(self.epoch)
+
+    def _set_cop_train_stage(self, epoch):
+        if not self.cop_enabled:
+            return
+        if self._cop_staged_training:
+            stage = ('cop_only' if epoch < self.cop_freeze_base_epochs
+                     else 'joint')
+        else:
+            stage = 'all'
+        if stage == self._cop_stage:
+            return
+        model = self.model.module if isinstance(
+            self.model, torch.nn.DataParallel) else self.model
+        model.set_cop_train_stage(stage)
+        self._cop_stage = stage
+        self.logger.info('CoP training stage: %s', stage)
         
     def train(self):
         start_epoch = self.epoch
@@ -69,6 +102,7 @@ class Trainer(object):
         best_result = self.best_result
         best_epoch = self.best_epoch
         for epoch in range(start_epoch, self.cfg['max_epoch']):
+            self._set_cop_train_stage(epoch)
             # reset random seed
             # ref: https://github.com/pytorch/pytorch/issues/5059
             np.random.seed(np.random.get_state()[1][0] + epoch)

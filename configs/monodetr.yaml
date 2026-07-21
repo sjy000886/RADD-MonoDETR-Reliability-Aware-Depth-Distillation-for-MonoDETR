@@ -1,5 +1,16 @@
 random_seed: 444
 
+# Lightweight MonoCoP adaptation. This keeps the RADD backbone, native DDN
+# branch and CompletionFormer feature-affinity regularizer unchanged.
+cop:
+  enabled: True
+  train_chain_prob: 0.5       # one hard route is sampled per query group
+  uncertainty_tau: 0.0       # use CoP at inference when chain log-variance is lower
+  size_residual_scale: 0.1
+  selector_enabled: True
+  freeze_base_epochs: 5      # with pretrain_model: train only new CoP modules first
+  joint_lr_scale: 0.1        # decoder/legacy-head LR after the frozen stage
+
 # Optional training-only depth feature regularization from CompletionFormer.
 # CompletionFormer commonly stores KITTI depths as uint16 PNG (metres * 256).
 teacher_depth:
@@ -60,7 +71,7 @@ dataset:
   depth_scale: 'normal'
 
 
-model_name: 'monodetr_completionformer_feature_reg'
+model_name: 'radd_monodetr_cop'
 model:
   num_classes: 3
   return_intermediate_dec: True
@@ -94,6 +105,7 @@ model:
   dropout: 0.1
   nheads: 8
   num_queries: 50
+  group_num: 11
   enc_n_points: 4
   dec_n_points: 4
   # DN
@@ -133,15 +145,15 @@ lr_scheduler:
   type: 'step'  # 'step' or 'cos'
   warmup: False  # 5 epoches, cosine warmup, init_lir=0.00001 in default
   decay_rate: 0.1
-  decay_list: [125, 165]
+  decay_list: [35, 50]
 
 
 trainer:
-  max_epoch: 195
+  max_epoch: 60
   gpu_ids: '1'
   save_frequency: 1  # checkpoint save interval (in epoch)
   # resume_model: True
-  # pretrain_model: path/to/ckpt
+  pretrain_model: 'outputs/monodetr_completionformer_feature_reg/checkpoint_best.pth'
   save_path: 'outputs/'
   save_all: False  # False for only savng the best and latest ckpts
   use_dn: False

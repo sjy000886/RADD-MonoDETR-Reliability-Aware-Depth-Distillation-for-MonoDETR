@@ -656,5 +656,6 @@ def build_depthaware_transformer(cfg):
         enc_n_points=cfg['enc_n_points'],
         two_stage=cfg['two_stage'],
         two_stage_num_proposals=cfg['num_queries'],
+        group_num=cfg.get('group_num', 11),
         use_dab= cfg['use_dab'],
         two_stage_dino = cfg['two_stage_dino'])

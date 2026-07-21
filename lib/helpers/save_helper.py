@@ -28,18 +28,33 @@ def save_checkpoint(state, filename):
     torch.save(state, filename)
 
 
-def load_checkpoint(model, optimizer, filename, map_location, logger=None):
+def load_checkpoint(model, optimizer, filename, map_location, logger=None, strict=True):
     if os.path.isfile(filename):
-        logger.info("==> Loading from checkpoint '{}'".format(filename))
+        if logger is not None:
+            logger.info("==> Loading from checkpoint '{}'".format(filename))
         checkpoint = torch.load(filename, map_location)
         epoch = checkpoint.get('epoch', -1)
         best_result = checkpoint.get('best_result', 0.0)
         best_epoch = checkpoint.get('best_epoch', 0.0)
         if model is not None and checkpoint['model_state'] is not None:
-            model.load_state_dict(checkpoint['model_state'])
+            model_to_load = (
+                model.module if isinstance(model, torch.nn.DataParallel)
+                else model)
+            incompatible = model_to_load.load_state_dict(
+                checkpoint['model_state'], strict=strict)
+            if not strict and logger is not None:
+                if incompatible.missing_keys:
+                    logger.info(
+                        "Missing checkpoint keys (new modules): %s",
+                        ", ".join(incompatible.missing_keys))
+                if incompatible.unexpected_keys:
+                    logger.info(
+                        "Unexpected checkpoint keys: %s",
+                        ", ".join(incompatible.unexpected_keys))
         if optimizer is not None and checkpoint['optimizer_state'] is not None:
             optimizer.load_state_dict(checkpoint['optimizer_state'])
-        logger.info("==> Done")
+        if logger is not None:
+            logger.info("==> Done")
     else:
         raise FileNotFoundError
 
