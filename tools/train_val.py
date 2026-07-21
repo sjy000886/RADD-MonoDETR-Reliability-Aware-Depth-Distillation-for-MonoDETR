@@ -12,6 +12,7 @@ sys.path.append(ROOT_DIR)
 import yaml
 import argparse
 import datetime
+import copy
 
 from lib.helpers.model_helper import build_model
 from lib.helpers.dataloader_helper import build_dataloader
@@ -33,6 +34,13 @@ def main():
     assert (os.path.exists(args.config))
     cfg = yaml.load(open(args.config, 'r'), Loader=yaml.Loader)
     set_random_seed(cfg.get('random_seed', 444))
+
+    # A single top-level block configures both data loading and the model loss.
+    teacher_depth_cfg = copy.deepcopy(cfg.get('teacher_depth', {}))
+    teacher_depth_cfg.setdefault('min_depth', cfg['model']['depth_min'])
+    teacher_depth_cfg.setdefault('max_depth', cfg['model']['depth_max'])
+    cfg['dataset']['teacher_depth'] = copy.deepcopy(teacher_depth_cfg)
+    cfg['model']['teacher_depth'] = copy.deepcopy(teacher_depth_cfg)
 
     model_name = cfg['model_name']
     output_path = os.path.join('./' + cfg["trainer"]['save_path'], model_name)

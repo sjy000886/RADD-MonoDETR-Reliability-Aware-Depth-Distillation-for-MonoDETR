@@ -1,12 +1,46 @@
 random_seed: 444
 
+# Optional training-only depth feature regularization from CompletionFormer.
+# CompletionFormer commonly stores KITTI depths as uint16 PNG (metres * 256).
+teacher_depth:
+  enabled: True
+  root_dir: '/media/data/dataset/KITTIDataset/training/pseudo_depth_completionformer'
+  filename_template: '{img_id:06d}.npy'  # also supports {split} and {index}
+  value_scale: 1.0                      # these float32 arrays are already in metres
+  confidence_root_dir: '/media/data/dataset/KITTIDataset/training/pseudo_confidence_completionformer'
+  confidence_filename_template: '{img_id:06d}.npy'
+  confidence_threshold: 0.0             # current confidence files are binary masks
+  npz_key: 'depth'
+  splits: ['train']                       # current folder covers ImageSets/train.txt
+  missing_policy: 'error'               # 'error' or 'zeros'
+  min_depth: 1e-3
+  max_depth: 60.0
+  augmentation_interpolation: 'masked_bilinear'
+  target_interpolation: 'masked_bilinear' # downsample safely to the 1/16 feature grid
+  loss_type: 'feature_affinity'          # training-only local geometry regularizer
+  loss_coef: 0.1
+  affinity_temperature: 0.1             # sensitivity to neighbouring log-depth changes
+  smooth_l1_beta: 0.1
+  feature_normalization_eps: 1e-6
+  eps: 1e-6
+  spatial_weighting:
+    enabled: True
+    background_weight: 0.1             # valid road/background pixels
+    background_start_ratio: 0.45       # ignore sky outside object boxes
+    box_edge_weight: 0.3                # outer 10% band of each 2D box
+    box_interior_weight: 1.0
+    box_center_weight: 1.5
+    box_center_ratio: 0.5               # central 50% in width and height
+    box_edge_ratio: 0.1
+  # Native DDN remains enabled and is the only loss supervising depth logits.
+
 
 dataset:
   type: &dataset_type 'KITTI'
-  root_dir: 'data/KITTIDataset'
+  root_dir: '/media/data/dataset/KITTIDataset'
   train_split: 'train'
   test_split: 'val'
-  batch_size: 16
+  batch_size: 10
   use_3d_center: True
   class_merging: False
   use_dontcare: False
@@ -26,7 +60,7 @@ dataset:
   depth_scale: 'normal'
 
 
-model_name: 'monodetr'
+model_name: 'monodetr_completionformer_feature_reg'
 model:
   num_classes: 3
   return_intermediate_dec: True
@@ -91,7 +125,7 @@ model:
 
 optimizer:
   type: 'adamw'
-  lr: 0.0002
+  lr: 0.00015
   weight_decay: 0.0001
 
 

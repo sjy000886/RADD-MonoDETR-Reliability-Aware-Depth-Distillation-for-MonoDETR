@@ -177,11 +177,14 @@ class Trainer(object):
         mask = targets['mask_2d']
 
         key_list = ['labels', 'boxes', 'calibs', 'depth', 'size_3d', 'heading_bin', 'heading_res', 'boxes_3d']
+        dense_key_list = [
+            'teacher_depth', 'teacher_depth_valid', 'teacher_depth_weight']
         for bz in range(batch_size):
             target_dict = {}
             for key, val in targets.items():
                 if key in key_list:
                     target_dict[key] = val[bz][mask[bz]]
+                elif key in dense_key_list:
+                    target_dict[key] = val[bz]
             targets_list.append(target_dict)
         return targets_list
-

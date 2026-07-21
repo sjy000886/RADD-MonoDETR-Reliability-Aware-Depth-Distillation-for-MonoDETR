@@ -18,6 +18,7 @@ from .depthaware_transformer import build_depthaware_transformer
 from .depth_predictor import DepthPredictor
 from .depth_predictor.ddn_loss import DDNLoss
 from lib.losses.focal_loss import sigmoid_focal_loss
+from lib.losses.teacher_depth_loss import TeacherDepthFeatureLoss
 from .dn_components import prepare_for_dn, dn_post_process, compute_dn_loss
 
 
@@ -198,7 +199,9 @@ class MonoDETR(nn.Module):
                 # only use one group in inference
                 query_embeds = self.query_embed.weight[:self.num_queries]
 
-        pred_depth_map_logits, depth_pos_embed, weighted_depth, depth_pos_embed_ip = self.depth_predictor(srcs, masks[1], pos[1])
+        (pred_depth_map_logits, depth_pos_embed, weighted_depth,
+         depth_pos_embed_ip, depth_feature) = self.depth_predictor(
+            srcs, masks[1], pos[1])
         
         hs, init_reference, inter_references, inter_references_dim, enc_outputs_class, enc_outputs_coord_unact = self.depthaware_transformer(
             srcs, masks, pos, query_embeds, depth_pos_embed, depth_pos_embed_ip)#, attn_mask)
@@ -272,6 +275,11 @@ class MonoDETR(nn.Module):
         out['pred_depth'] = outputs_depth[-1]
         out['pred_angle'] = outputs_angle[-1]
         out['pred_depth_map_logits'] = pred_depth_map_logits
+        out['pred_depth_map'] = weighted_depth
+        if self.training:
+            # Exposed only for the training-time CompletionFormer geometry
+            # regularizer. It is not consumed by the detector or inference.
+            out['pred_depth_feature'] = depth_feature
 
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(
@@ -299,7 +307,8 @@ class SetCriterion(nn.Module):
         1) we compute hungarian assignment between ground truth boxes and the outputs of the model
         2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
     """
-    def __init__(self, num_classes, matcher, weight_dict, focal_alpha, losses, group_num=11):
+    def __init__(self, num_classes, matcher, weight_dict, focal_alpha, losses,
+                 group_num=11, teacher_depth_cfg=None):
         """ Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -314,7 +323,11 @@ class SetCriterion(nn.Module):
         self.weight_dict = weight_dict
         self.losses = losses
         self.focal_alpha = focal_alpha
-        self.ddn_loss = DDNLoss()  # for depth map
+        self.ddn_loss = DDNLoss() if 'depth_map' in losses else None
+        self.teacher_depth_loss = (
+            TeacherDepthFeatureLoss(teacher_depth_cfg)
+            if teacher_depth_cfg and teacher_depth_cfg.get('enabled', False)
+            else None)
         self.group_num = group_num
 
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
@@ -459,6 +472,29 @@ class SetCriterion(nn.Module):
             depth_map_logits, gt_boxes2d, num_gt_per_img, gt_center_depth)
         return losses
 
+    def loss_teacher_depth(self, outputs, targets, indices, num_boxes):
+        if self.teacher_depth_loss is None:
+            raise RuntimeError('Teacher depth loss was requested but is not configured')
+        if any('teacher_depth' not in target for target in targets):
+            raise KeyError(
+                'Teacher depth feature regularization is enabled, but the dataset did not return '
+                "'teacher_depth'. Check teacher_depth.splits and root_dir.")
+
+        teacher_depth = torch.stack([target['teacher_depth'] for target in targets])
+        teacher_valid = torch.stack([
+            target['teacher_depth_valid'] for target in targets])
+        teacher_weight = torch.stack([
+            target['teacher_depth_weight'] for target in targets])
+        teacher_boxes = [target['boxes'] for target in targets]
+        if 'pred_depth_feature' not in outputs:
+            raise KeyError(
+                "Teacher feature regularization requires 'pred_depth_feature' "
+                "from the training forward pass")
+        feature_loss = self.teacher_depth_loss(
+            outputs['pred_depth_feature'], teacher_depth, teacher_valid,
+            teacher_weight, teacher_boxes)
+        return {'loss_teacher_depth_feature': feature_loss}
+
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
@@ -482,6 +518,7 @@ class SetCriterion(nn.Module):
             'angles': self.loss_angles,
             'center': self.loss_3dcenter,
             'depth_map': self.loss_depth_map,
+            'teacher_depth': self.loss_teacher_depth,
         }
 
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
@@ -519,7 +556,7 @@ class SetCriterion(nn.Module):
             for i, aux_outputs in enumerate(outputs['aux_outputs']):
                 indices = self.matcher(aux_outputs, targets, group_num=group_num)
                 for loss in self.losses:
-                    if loss == 'depth_map':
+                    if loss in ['depth_map', 'teacher_depth']:
                         # Intermediate masks losses are too costly to compute, we ignore them.
                         continue
                     kwargs = {}
@@ -582,6 +619,14 @@ def build(cfg):
     weight_dict['loss_depth'] = cfg['depth_loss_coef']
     weight_dict['loss_center'] = cfg['3dcenter_loss_coef']
     weight_dict['loss_depth_map'] = cfg['depth_map_loss_coef']
+
+    teacher_depth_cfg = copy.deepcopy(cfg.get('teacher_depth', {}))
+    teacher_depth_cfg.setdefault('min_depth', cfg['depth_min'])
+    teacher_depth_cfg.setdefault('max_depth', cfg['depth_max'])
+    teacher_depth_enabled = bool(teacher_depth_cfg.get('enabled', False))
+    if teacher_depth_enabled:
+        weight_dict['loss_teacher_depth_feature'] = float(
+            teacher_depth_cfg.get('loss_coef', 0.1))
     
     # dn loss
     if cfg['use_dn']:
@@ -599,14 +644,20 @@ def build(cfg):
         aux_weight_dict.update({k + f'_enc': v for k, v in weight_dict.items()})
         weight_dict.update(aux_weight_dict)
 
-    losses = ['labels', 'boxes', 'cardinality', 'depths', 'dims', 'angles', 'center', 'depth_map']
+    losses = ['labels', 'boxes', 'cardinality', 'depths', 'dims', 'angles', 'center']
+    # CompletionFormer now regularizes an intermediate feature only. Keep the
+    # native DDN objective as the sole supervision for MonoDETR depth logits.
+    losses.append('depth_map')
+    if teacher_depth_enabled:
+        losses.append('teacher_depth')
     
     criterion = SetCriterion(
         cfg['num_classes'],
         matcher=matcher,
         weight_dict=weight_dict,
         focal_alpha=cfg['focal_alpha'],
-        losses=losses)
+        losses=losses,
+        teacher_depth_cfg=teacher_depth_cfg)
 
     device = torch.device(cfg['device'])
     criterion.to(device)

@@ -1,0 +1,37 @@
+# 模型权重
+*.pth
+*.pt
+*.ckpt
+*.onnx
+
+# 深度图和缓存
+*.npy
+*.npz
+*.pkl
+
+# 压缩包
+*.zip
+*.tar
+*.tar.gz
+
+# 数据集
+data/
+dataset/
+datasets/
+
+# 训练输出
+checkpoints/
+checkpoint/
+outputs/
+output/
+logs/
+wandb/
+runs/
+
+# Python缓存
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
