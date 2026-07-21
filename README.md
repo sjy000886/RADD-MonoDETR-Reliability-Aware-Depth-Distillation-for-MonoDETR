@@ -124,6 +124,40 @@ New and better results in this repo:
 You can modify the settings of models and training in `configs/monodetr.yaml` and indicate the GPU in `train.sh`:
 
     bash train.sh configs/monodetr.yaml > logs/monodetr.log
+
+### CompletionFormer training-time feature regularization
+
+MonoDETR can use dense depth maps generated offline by CompletionFormer as a training-only geometric feature regularizer. The teacher depth never enters the detector forward path and does not directly supervise MonoDETR's depth logits or expected depth. Save one map per KITTI image, keep the original image resolution and ID, then enable the top-level `teacher_depth` block in `configs/monodetr.yaml`:
+
+```yaml
+teacher_depth:
+  enabled: True
+  root_dir: '/data/completionformer_predictions'
+  filename_template: '{img_id:06d}.png'
+  value_scale: 256.0
+  confidence_root_dir: '/data/completionformer_confidence'
+  confidence_filename_template: '{img_id:06d}.npy'
+  confidence_threshold: 0.0
+  loss_type: 'feature_affinity'
+  loss_coef: 0.1
+  affinity_temperature: 0.1
+  smooth_l1_beta: 0.1
+  spatial_weighting:
+    enabled: True
+    background_weight: 0.1
+    background_start_ratio: 0.45
+    box_edge_weight: 0.3
+    box_interior_weight: 1.0
+    box_center_weight: 1.5
+    box_center_ratio: 0.5
+    box_edge_ratio: 0.1
+```
+
+The loader accepts PNG/TIFF, `.npy`, and `.npz` maps. `value_scale` is the number stored in the file for one metre: use `256.0` for KITTI-style uint16 PNG and `1.0` for metre-valued arrays. A matching confidence map is required; only finite pixels above `confidence_threshold` are used. Invalid, non-finite, zero, out-of-range, and low-confidence pixels are ignored. The same flip/crop transform applied to RGB is also applied to teacher depth and its validity mask.
+
+For each horizontal and vertical neighbour pair on MonoDETR's 1/16 depth-feature grid, the regularizer converts the CompletionFormer log-depth difference into a target affinity. It then applies Smooth L1 between that target and the cosine similarity of the corresponding normalized student features. Pair confidence is the lower confidence of the two pixels and is multiplied by both spatial weights. The loss is logged as `loss_teacher_depth_feature`.
+
+MonoDETR's original DDN depth-map loss remains enabled and is the only loss that supervises `depth_logits` and `weighted_depth`, preserving its object-centre-depth semantics. Spatial weighting focuses only the feature regularizer on object geometry: valid lower-background pixels receive the background weight, upper background is ignored as sky, and target boxes are divided into edge, interior, and central regions. CompletionFormer files and this loss are unused during inference.
    
 ### Test
 The best checkpoint will be evaluated as default. You can change it at "tester/checkpoint" in `configs/monodetr.yaml`:
