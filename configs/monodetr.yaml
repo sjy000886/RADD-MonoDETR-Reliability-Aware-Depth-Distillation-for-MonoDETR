@@ -4,12 +4,17 @@ random_seed: 444
 # branch and CompletionFormer feature-affinity regularizer unchanged.
 cop:
   enabled: True
-  train_chain_prob: 0.5       # one hard route is sampled per query group
-  uncertainty_tau: 0.0       # use CoP at inference when chain log-variance is lower
+  train_chain_prob: 0.5     # best recipe: supervise chain/parallel routes by query group
+  # Relative inference routing: use CoP when
+  # chain_log_variance - parallel_log_variance < uncertainty_tau.
+  selector_mode: 'relative'   # 'absolute' keeps the original chain-only rule
+  uncertainty_tau: 0.010127097  # exact best delta threshold for the epoch-46 checkpoint
   size_residual_scale: 0.1
-  selector_enabled: True
-  freeze_base_epochs: 5      # with pretrain_model: train only new CoP modules first
-  joint_lr_scale: 0.1        # decoder/legacy-head LR after the frozen stage
+  selector_enabled: True     # valid because both depth branches are supervised
+  freeze_base_epochs: 5      # first adapt only the newly added CoP modules
+  joint_lr_scale: 0.1        # protect the pretrained decoder/legacy heads
+  # Preserve the best RADD/CompletionFormer depth representation in this run.
+  unfreeze_depth_predictor_in_joint: False
 
 # Optional training-only depth feature regularization from CompletionFormer.
 # CompletionFormer commonly stores KITTI depths as uint16 PNG (metres * 256).
@@ -71,7 +76,7 @@ dataset:
   depth_scale: 'normal'
 
 
-model_name: 'radd_monodetr_cop'
+model_name: 'radd_monodetr_cop5_best_recipe'
 model:
   num_classes: 3
   return_intermediate_dec: True
@@ -143,7 +148,7 @@ optimizer:
 
 lr_scheduler:
   type: 'step'  # 'step' or 'cos'
-  warmup: False  # 5 epoches, cosine warmup, init_lir=0.00001 in default
+  warmup: False  # preserve full CoP LR during the 5-epoch adaptation stage
   decay_rate: 0.1
   decay_list: [35, 50]
 

@@ -59,10 +59,17 @@ class MonoDETR(nn.Module):
         self.uncertainty_tau = float(cop_cfg.get('uncertainty_tau', 0.0))
         self.size_residual_scale = float(cop_cfg.get('size_residual_scale', 0.1))
         self.selector_enabled = bool(cop_cfg.get('selector_enabled', True))
+        self.selector_mode = str(
+            cop_cfg.get('selector_mode', 'absolute')).lower()
+        self.unfreeze_depth_predictor_in_joint = bool(
+            cop_cfg.get('unfreeze_depth_predictor_in_joint', False))
         if not 0.0 <= self.train_chain_prob <= 1.0:
             raise ValueError("cop.train_chain_prob must be in [0, 1]")
         if self.size_residual_scale < 0.0:
             raise ValueError("cop.size_residual_scale must be non-negative")
+        if self.selector_mode not in {'absolute', 'relative'}:
+            raise ValueError(
+                "cop.selector_mode must be 'absolute' or 'relative'")
         self.label_enc = nn.Embedding(num_classes + 1, hidden_dim - 1)  # # for indicator
         # prediction heads
         self.class_embed = nn.Linear(hidden_dim, num_classes)
@@ -186,8 +193,9 @@ class MonoDETR(nn.Module):
 
         ``cop_only`` freezes the complete pre-trained RADD model. ``joint``
         additionally unfreezes the decoder and the existing 3D heads at their
-        optimizer-configured lower learning rate. The backbone and depth
-        predictor remain frozen in both stages.
+        optimizer-configured lower learning rate. The depth predictor is also
+        unfrozen in ``joint`` when explicitly enabled by the CoP config; the
+        backbone remains frozen in both staged modes.
         """
         if not self.cop_enabled:
             return
@@ -214,12 +222,14 @@ class MonoDETR(nn.Module):
                 parameter.requires_grad_(True)
 
         if stage == 'joint':
-            joint_modules = (
+            joint_modules = [
                 self.depthaware_transformer.decoder,
                 self.dim_embed_3d,
                 self.angle_embed,
                 self.depth_embed,
-            )
+            ]
+            if self.unfreeze_depth_predictor_in_joint:
+                joint_modules.append(self.depth_predictor)
             for module in joint_modules:
                 for parameter in module.parameters():
                     parameter.requires_grad_(True)
@@ -371,7 +381,14 @@ class MonoDETR(nn.Module):
                         chain_prob=self.train_chain_prob,
                         mask=route_mask)
                 elif self.selector_enabled:
-                    use_chain = chain_depth[..., 1:2] < self.uncertainty_tau
+                    chain_log_variance = chain_depth[..., 1:2]
+                    parallel_log_variance = parallel_depth[..., 1:2]
+                    if self.selector_mode == 'relative':
+                        selector_uncertainty = (
+                            chain_log_variance - parallel_log_variance)
+                    else:
+                        selector_uncertainty = chain_log_variance
+                    use_chain = selector_uncertainty < self.uncertainty_tau
                     depth_ave = torch.where(use_chain, chain_depth, parallel_depth)
                 else:
                     depth_ave = chain_depth
@@ -394,6 +411,16 @@ class MonoDETR(nn.Module):
         out['pred_angle'] = outputs_angle[-1]
         out['pred_depth_map_logits'] = pred_depth_map_logits
         out['pred_depth_map'] = weighted_depth
+        if self.cop_enabled and not self.training:
+            # Evaluation-only diagnostics used to calibrate the uncertainty
+            # threshold without changing the detector's training objectives.
+            out['pred_depth_chain'] = chain_depth
+            out['pred_depth_parallel'] = parallel_depth
+            out['pred_chain_log_variance'] = chain_depth[..., 1:2]
+            out['pred_parallel_log_variance'] = parallel_depth[..., 1:2]
+            if self.selector_enabled:
+                out['pred_selector_uncertainty'] = selector_uncertainty
+                out['pred_cop_selector'] = use_chain
         if self.training:
             # Exposed only for the training-time CompletionFormer geometry
             # regularizer. It is not consumed by the detector or inference.
